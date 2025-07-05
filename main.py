@@ -23,6 +23,48 @@ def round_to_BFP16(x: np.ndarray, block: int) -> np.ndarray:
     bits = bits & np.uint32(0xFFFF0000)
     return bits.view(np.float32)
 
+def MXINT8(x: np.ndarray, block: int) -> np.ndarray:
+    """
+    Quantizes a float32 array to MXINT8 using power-of-two scaling,
+    following the specified algorithm, and then dequantizes it.
+    https://arxiv.org/pdf/2310.10537
+    """
+    dequantized_x = np.empty_like(x, dtype=np.float32)
+    
+    # For INT8, the maximum value is 127. The exponent of the largest
+    # normal number in the element data format (emax_elem) is floor(log2(127)).
+    emax_elem = np.floor(np.log2(127.0)) # 6.0
+
+    # Iterate over the array in blocks of the specified size
+    for i in range(0, x.size, block):
+        current_block = x[i:i+block]
+        abs_max = np.max(np.abs(current_block))
+
+        if abs_max == 0:
+            dequantized_x[i:i+block] = current_block
+            continue
+
+        # Algorithm Step 1: Calculate the shared exponent
+        # shared_exp <- floor(log2(max_i(|V_i|))) - emax_elem
+        shared_exp = np.floor(np.log2(abs_max)) - emax_elem
+
+        # Algorithm Step 2: Calculate the scaling factor 'X'
+        # X <- 2^shared_exp
+        scale_x = 2.0**shared_exp
+
+        # Algorithm Step 4 (for INT8): Quantize to element format
+        # P_i = quantize_to_element_format(V_i / X)
+        # This involves scaling, rounding, and clamping to the INT8 range.
+        quantized_block = np.round(current_block / scale_x)
+        quantized_block = np.clip(quantized_block, -127, 127)
+
+        # Dequantize: scale the integer block back to the original float range
+        dequantized_block = quantized_block * scale_x
+
+        # Store the dequantized block in our output array
+        dequantized_x[i:i+block] = dequantized_block
+
+    return dequantized_x
 
 def compute_mse(original: np.ndarray, reconstructed: np.ndarray) -> float:
     diff = original - reconstructed
@@ -84,7 +126,8 @@ def main():
 
     quantizers = {
         "method_1": round_to_FP16,
-        "method_2": round_to_BFP16
+        "method_2": round_to_BFP16,
+        "method_3": MXINT8
     }
 
     results = run_benchmark(args.method, data, quantizers, args.block)
