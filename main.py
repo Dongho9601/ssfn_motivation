@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import math
 import numpy as np
 from typing import Callable, Dict
 
@@ -22,6 +23,68 @@ def round_to_BFP16(x: np.ndarray, block: int) -> np.ndarray:
     bits = bits + np.uint32(0x00008000)
     bits = bits & np.uint32(0xFFFF0000)
     return bits.view(np.float32)
+
+
+def _mx_quantize_int(x: np.ndarray, block: int, bits: int) -> np.ndarray:
+    """Block-wise symmetric integer quantization with dynamic scale."""
+    if block <= 0:
+        raise ValueError("block must be positive")
+    max_int = 2 ** (bits - 1) - 1
+    out = np.empty_like(x, dtype=np.float32)
+    for i in range(0, len(x), block):
+        chunk = x[i : i + block]
+        amax = np.max(np.abs(chunk))
+        if amax == 0:
+            out[i : i + block] = 0
+            continue
+        scale = amax / max_int
+        q = np.round(chunk / scale)
+        q = np.clip(q, -max_int, max_int)
+        out[i : i + block] = q * scale
+    return out
+
+
+def _mx_quantize_fp(
+    x: np.ndarray, block: int, exp_bits: int, mant_bits: int
+) -> np.ndarray:
+    """Block-wise floating point quantization according to MXFP specs."""
+    if block <= 0:
+        raise ValueError("block must be positive")
+    out = np.empty_like(x, dtype=np.float32)
+    max_exp = 2 ** (exp_bits - 1) - 1
+    min_exp = -max_exp
+    step = 1 << mant_bits
+    max_mant = 2.0 - math.ldexp(1.0, -mant_bits)
+    for i in range(0, len(x), block):
+        chunk = x[i : i + block]
+        amax = np.max(np.abs(chunk))
+        if amax == 0:
+            out[i : i + block] = 0
+            continue
+        exp = int(math.floor(math.log2(amax)))
+        exp = max(min(exp, max_exp), min_exp)
+        scale = math.ldexp(1.0, -exp)
+        scaled = chunk * scale
+        scaled = np.clip(scaled, -max_mant, max_mant)
+        quant = np.round(scaled * step) / step
+        out[i : i + block] = quant / scale
+    return out
+
+
+def round_to_MXINT8(x: np.ndarray, block: int) -> np.ndarray:
+    return _mx_quantize_int(x, block, 8)
+
+
+def round_to_MXFP8(x: np.ndarray, block: int) -> np.ndarray:
+    return _mx_quantize_fp(x, block, 4, 3)
+
+
+def round_to_MXFP6(x: np.ndarray, block: int) -> np.ndarray:
+    return _mx_quantize_fp(x, block, 3, 2)
+
+
+def round_to_MXFP4(x: np.ndarray, block: int) -> np.ndarray:
+    return _mx_quantize_fp(x, block, 2, 1)
 
 
 def compute_mse(original: np.ndarray, reconstructed: np.ndarray) -> float:
@@ -83,8 +146,12 @@ def main():
     data = generate_data(args.size, args.seed)
 
     quantizers = {
-        "method_1": round_to_FP16,
-        "method_2": round_to_BFP16
+        "FP16": round_to_FP16,
+        "BFP16": round_to_BFP16,
+        "MXINT8": round_to_MXINT8,
+        "MXFP8": round_to_MXFP8,
+        "MXFP6": round_to_MXFP6,
+        "MXFP4": round_to_MXFP4,
     }
 
     results = run_benchmark(args.method, data, quantizers, args.block)
